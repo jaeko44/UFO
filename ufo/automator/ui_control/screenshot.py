@@ -82,7 +82,7 @@ class ControlPhotographer(Photographer):
     def capture(self, save_path: str = None, scalar: List[int] = None) -> Image.Image:
         """
         Capture a screenshot of the control window.
-        Falls back to desktop screenshot if window capture fails.
+        Falls back through: pywinauto -> PrintWindow -> desktop screenshot.
         :param save_path: The path to save the screenshot.
         :return: The screenshot.
         """
@@ -104,7 +104,22 @@ class ControlPhotographer(Photographer):
             except Exception:
                 screenshot = None
 
-        # Attempt 2: fall back to desktop capture
+        # Attempt 2: PrintWindow API (works on disconnected RDP sessions)
+        if screenshot is None:
+            try:
+                hwnd = self.control.handle
+                if hwnd:
+                    logger.info("Trying PrintWindow for window capture (RDP-safe)")
+                    screenshot = _win32_print_window(hwnd)
+                    if screenshot is not None:
+                        w, h = screenshot.size
+                        if w <= 1 or h <= 1 or screenshot.getbbox() is None:
+                            logger.warning("PrintWindow returned empty/tiny image")
+                            screenshot = None
+            except Exception as e:
+                logger.warning(f"PrintWindow fallback failed: {e}")
+
+        # Attempt 3: fall back to desktop capture
         if screenshot is None:
             logger.info("Falling back to desktop screenshot for window capture")
             desktop = DesktopPhotographer(all_screens=False)
@@ -118,19 +133,91 @@ class ControlPhotographer(Photographer):
         return screenshot
 
 
+def _win32_print_window(hwnd: int) -> Optional[Image.Image]:
+    """
+    Capture a window using the PrintWindow API.
+    This works even on disconnected RDP sessions because PrintWindow asks the
+    window to paint itself to a device context rather than reading from the
+    screen buffer (which doesn't exist when RDP is disconnected).
+    :param hwnd: The window handle to capture.
+    :return: A PIL Image of the window, or None on failure.
+    """
+    try:
+        import ctypes
+        import win32gui
+        import win32ui
+        import win32con
+
+        # Get window dimensions
+        rect = win32gui.GetWindowRect(hwnd)
+        width = rect[2] - rect[0]
+        height = rect[3] - rect[1]
+
+        if width <= 0 or height <= 0:
+            return None
+
+        hwnd_dc = win32gui.GetWindowDC(hwnd)
+        mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+        save_dc = mfc_dc.CreateCompatibleDC()
+
+        bmp = win32ui.CreateBitmap()
+        bmp.CreateCompatibleBitmap(mfc_dc, width, height)
+        save_dc.SelectObject(bmp)
+
+        # PW_RENDERFULLCONTENT = 2 — works on Windows 8.1+ and captures
+        # the full content even when the window is occluded or off-screen.
+        PW_RENDERFULLCONTENT = 2
+        result = ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), PW_RENDERFULLCONTENT)
+
+        if not result:
+            # Fallback to PW_CLIENTONLY = 1
+            result = ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 1)
+
+        if not result:
+            save_dc.DeleteDC()
+            mfc_dc.DeleteDC()
+            win32gui.ReleaseDC(hwnd, hwnd_dc)
+            win32gui.DeleteObject(bmp.GetHandle())
+            return None
+
+        bmpinfo = bmp.GetInfo()
+        bmpstr = bmp.GetBitmapBits(True)
+        screenshot = Image.frombuffer(
+            "RGB",
+            (bmpinfo["bmWidth"], bmpinfo["bmHeight"]),
+            bmpstr,
+            "raw",
+            "BGRX",
+            0,
+            1,
+        )
+
+        # Cleanup GDI objects
+        save_dc.DeleteDC()
+        mfc_dc.DeleteDC()
+        win32gui.ReleaseDC(hwnd, hwnd_dc)
+        win32gui.DeleteObject(bmp.GetHandle())
+
+        return screenshot
+    except Exception as e:
+        logger.warning(f"PrintWindow capture failed for hwnd={hwnd}: {e}")
+        return None
+
+
 def _win32_grab_screen() -> Optional[Image.Image]:
     """
     Fallback screen capture using win32 APIs when PIL ImageGrab fails.
-    Captures the primary monitor only.
+    Tries BitBlt first (fast), then PrintWindow on the desktop window
+    (works on disconnected RDP sessions).
     :return: A PIL Image of the screen, or None on failure.
     """
+    # Attempt 1: BitBlt from desktop DC (fast, but fails on disconnected RDP)
     try:
         import win32gui
         import win32ui
         import win32con
         import win32api
 
-        # Get the primary monitor dimensions
         width = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
         height = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
 
@@ -144,7 +231,6 @@ def _win32_grab_screen() -> Optional[Image.Image]:
         mem_dc.SelectObject(screenshot_bmp)
         mem_dc.BitBlt((0, 0), (width, height), img_dc, (0, 0), win32con.SRCCOPY)
 
-        # Convert to PIL Image
         bmpinfo = screenshot_bmp.GetInfo()
         bmpstr = screenshot_bmp.GetBitmapBits(True)
         screenshot = Image.frombuffer(
@@ -157,16 +243,48 @@ def _win32_grab_screen() -> Optional[Image.Image]:
             1,
         )
 
-        # Cleanup GDI objects
         mem_dc.DeleteDC()
         img_dc.DeleteDC()
         win32gui.ReleaseDC(hdesktop, desktop_dc)
         win32gui.DeleteObject(screenshot_bmp.GetHandle())
 
-        return screenshot
+        # Validate: check it's not all-black (common on disconnected RDP)
+        if screenshot.getbbox() is not None:
+            return screenshot
+        else:
+            logger.warning("BitBlt returned all-black image (likely disconnected RDP)")
     except Exception as e:
-        logger.error(f"win32 fallback screen grab also failed: {e}")
-        return None
+        logger.warning(f"win32 BitBlt screen grab failed: {e}")
+
+    # Attempt 2: PrintWindow on the desktop window
+    try:
+        import win32gui
+        hdesktop = win32gui.GetDesktopWindow()
+        screenshot = _win32_print_window(hdesktop)
+        if screenshot is not None and screenshot.getbbox() is not None:
+            return screenshot
+        else:
+            logger.warning("PrintWindow on desktop returned empty image")
+    except Exception as e:
+        logger.warning(f"PrintWindow desktop capture failed: {e}")
+
+    # Attempt 3: PrintWindow on the foreground window as a best-effort
+    # desktop substitute (works on disconnected RDP for GUI windows)
+    try:
+        import win32gui
+        fg_hwnd = win32gui.GetForegroundWindow()
+        if fg_hwnd and fg_hwnd != 0:
+            logger.info("Trying PrintWindow on foreground window as desktop fallback")
+            screenshot = _win32_print_window(fg_hwnd)
+            if screenshot is not None and screenshot.getbbox() is not None:
+                return screenshot
+            else:
+                logger.warning("PrintWindow on foreground window returned empty image")
+    except Exception as e:
+        logger.warning(f"PrintWindow foreground window capture failed: {e}")
+
+    logger.error("All win32 screen grab methods failed")
+    return None
 
 
 class DesktopPhotographer(Photographer):
