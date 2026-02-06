@@ -81,18 +81,92 @@ class ControlPhotographer(Photographer):
 
     def capture(self, save_path: str = None, scalar: List[int] = None) -> Image.Image:
         """
-        Capture a screenshot.
+        Capture a screenshot of the control window.
+        Falls back to desktop screenshot if window capture fails.
         :param save_path: The path to save the screenshot.
         :return: The screenshot.
         """
-        # Capture single window screenshot
-        screenshot = self.control.capture_as_image()
+        screenshot = None
+
+        # Attempt 1: capture via pywinauto
+        try:
+            screenshot = self.control.capture_as_image()
+        except Exception as e:
+            logger.warning(f"control.capture_as_image() failed: {e}")
+
+        # Validate the captured image
+        if screenshot is not None:
+            try:
+                w, h = screenshot.size
+                if w <= 1 or h <= 1:
+                    logger.warning("control.capture_as_image() returned a tiny image, treating as invalid")
+                    screenshot = None
+            except Exception:
+                screenshot = None
+
+        # Attempt 2: fall back to desktop capture
+        if screenshot is None:
+            logger.info("Falling back to desktop screenshot for window capture")
+            desktop = DesktopPhotographer(all_screens=False)
+            screenshot = desktop.capture()
+
         if scalar is not None:
             screenshot = self.rescale_image(screenshot, scalar)
 
         if save_path is not None and screenshot is not None:
             screenshot.save(save_path, compress_level=DEFAULT_PNG_COMPRESS_LEVEL)
         return screenshot
+
+
+def _win32_grab_screen() -> Optional[Image.Image]:
+    """
+    Fallback screen capture using win32 APIs when PIL ImageGrab fails.
+    Captures the primary monitor only.
+    :return: A PIL Image of the screen, or None on failure.
+    """
+    try:
+        import win32gui
+        import win32ui
+        import win32con
+        import win32api
+
+        # Get the primary monitor dimensions
+        width = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
+        height = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
+
+        hdesktop = win32gui.GetDesktopWindow()
+        desktop_dc = win32gui.GetWindowDC(hdesktop)
+        img_dc = win32ui.CreateDCFromHandle(desktop_dc)
+        mem_dc = img_dc.CreateCompatibleDC()
+
+        screenshot_bmp = win32ui.CreateBitmap()
+        screenshot_bmp.CreateCompatibleBitmap(img_dc, width, height)
+        mem_dc.SelectObject(screenshot_bmp)
+        mem_dc.BitBlt((0, 0), (width, height), img_dc, (0, 0), win32con.SRCCOPY)
+
+        # Convert to PIL Image
+        bmpinfo = screenshot_bmp.GetInfo()
+        bmpstr = screenshot_bmp.GetBitmapBits(True)
+        screenshot = Image.frombuffer(
+            "RGB",
+            (bmpinfo["bmWidth"], bmpinfo["bmHeight"]),
+            bmpstr,
+            "raw",
+            "BGRX",
+            0,
+            1,
+        )
+
+        # Cleanup GDI objects
+        mem_dc.DeleteDC()
+        img_dc.DeleteDC()
+        win32gui.ReleaseDC(hdesktop, desktop_dc)
+        win32gui.DeleteObject(screenshot_bmp.GetHandle())
+
+        return screenshot
+    except Exception as e:
+        logger.error(f"win32 fallback screen grab also failed: {e}")
+        return None
 
 
 class DesktopPhotographer(Photographer):
@@ -109,11 +183,36 @@ class DesktopPhotographer(Photographer):
 
     def capture(self, save_path: str = None, scalar: List[int] = None) -> Image.Image:
         """
-        Capture a screenshot.
+        Capture a screenshot with fallbacks.
+        Tries: ImageGrab(all_screens) -> ImageGrab(primary only) -> win32 API.
         :param save_path: The path to save the screenshot.
         :return: The screenshot.
         """
-        screenshot = ImageGrab.grab(all_screens=self.all_screens)
+        screenshot = None
+
+        # Attempt 1: ImageGrab with requested all_screens setting
+        try:
+            screenshot = ImageGrab.grab(all_screens=self.all_screens)
+        except Exception as e:
+            logger.warning(f"ImageGrab.grab(all_screens={self.all_screens}) failed: {e}")
+
+        # Attempt 2: If all_screens was True, retry with primary screen only
+        if screenshot is None and self.all_screens:
+            try:
+                logger.info("Retrying screenshot with primary screen only")
+                screenshot = ImageGrab.grab(all_screens=False)
+            except Exception as e:
+                logger.warning(f"ImageGrab.grab(all_screens=False) also failed: {e}")
+
+        # Attempt 3: win32 API fallback
+        if screenshot is None:
+            logger.info("Falling back to win32 API screen capture")
+            screenshot = _win32_grab_screen()
+
+        if screenshot is None:
+            logger.error("All screenshot capture methods failed; returning 1x1 placeholder image")
+            screenshot = Image.new("RGB", (1, 1), (0, 0, 0))
+
         if scalar is not None:
             screenshot = self.rescale_image(screenshot, scalar)
         if save_path is not None and screenshot is not None:
