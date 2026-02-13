@@ -81,6 +81,13 @@ class BaseOpenAIService(BaseService):
                         )
                         self.config_llm["JSON_SCHEMA"] = False
                         self.json_schema_enabled = False
+                except (openai.NotFoundError, openai.AuthenticationError, openai.APIConnectionError, openai.APITimeoutError, openai.APIStatusError) as e:
+                    self.logger.warning(
+                        f"Startup probe for model {self.model} failed with {type(e).__name__}: {e}. "
+                        f"Continuing without JSON schema validation."
+                    )
+                    self.config_llm["JSON_SCHEMA"] = False
+                    self.json_schema_enabled = False
                 break  # Exit the loop if no exception is raised
 
     def _chat_completion(
